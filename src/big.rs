@@ -608,6 +608,33 @@ impl Archive {
 
     /// Extract entries to `out_dir`. `progress` is called after each entry so a CLI can render a
     /// bar without this module knowing about terminals.
+    /// Raw bytes of one entry, optionally unwrapped from a chunkzip/chunkref container.
+    pub fn entry_bytes(&self, index: usize, decompress: bool) -> Result<Vec<u8>, String> {
+        let rec = self
+            .records()
+            .get(index)
+            .cloned()
+            .ok_or_else(|| format!("no entry at index {index}"))?;
+        let (address, size) = match (rec.address, rec.size) {
+            (Some(a), Some(s)) => (a, s),
+            _ => return Err(format!("{} is unresolved", rec.path)),
+        };
+        let start = address as usize;
+        let end = start.saturating_add(size as usize);
+        if end > self.data.len() {
+            return Err(format!("{} runs past the end of the archive", rec.path));
+        }
+        let mut buf = self.data[start..end].to_vec();
+        if decompress {
+            if crate::chunkzip::is_chunkzip(&buf) {
+                buf = crate::chunkzip::decode(&buf)?;
+            } else if crate::chunkref::is_chunkref(&buf) {
+                buf = crate::chunkref::decode(&buf)?.0;
+            }
+        }
+        Ok(buf)
+    }
+
     pub fn extract(
         &self,
         out_dir: &Path,

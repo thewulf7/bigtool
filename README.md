@@ -171,6 +171,28 @@ nested           : 1241 archives, 28415 files (220 inner entries unreadable)
 
 Recursion stops at depth 4. All 1 609 archives now extract without unreadable entries.
 
+## Desktop app
+
+`bigtool-gui` is an egui front-end — one binary, no Electron, no Node:
+
+```bash
+cargo build --release --features gui     # -> target/release/bigtool-gui.exe
+bigtool-gui some_archive.big             # or just open it and drop the file in
+```
+
+| Panel | What it does |
+|---|---|
+| Archive | entry table with path/idx/address/size, filter box, extract all or up to a selection, export one entry, export a `.gnf` entry straight to `.dds` |
+| Textures | batch `.gnf` → `.dds` over a folder tree |
+| Pack | folder → `.big` |
+
+Extraction runs on a worker thread with a live progress bar, and the log reports the same figures
+the CLI prints. The output folder defaults to `<archive>_extracted` beside the archive, so
+"Extract all" works without picking a directory first.
+
+The GUI calls the same library the CLI does — verified by extracting `patch_b.big` through both and
+comparing: 2 112 files, 2 112 byte-identical, 0 differences.
+
 ## Packing
 
 `pack` rebuilds an archive from a directory tree — the reverse of `extract`:
@@ -247,6 +269,12 @@ Outputs were compared byte-for-byte against the original Python implementation:
 - `pack`: build a `.big` from a directory tree, with `--template` for drop-in replacement of a
   shipped archive. Round-trip verified byte-exact (58 and 2 656 file trees).
 - `check` recognises `RSF ` model containers and `chunkref` stubs as known payloads.
+
+**1.4.0**
+- Desktop app (`bigtool-gui`): archive browser, extract with live progress, single-entry export,
+  `.gnf` → `.dds` export from inside an archive, texture batch, and packing.
+- The CLI and the app now share a library crate instead of each owning the modules.
+- `Archive::entry_bytes()` reads one entry's payload, optionally unwrapping chunkzip/chunkref.
 
 **1.3.1**
 - Fixed the file-info record length field: field 2 is the stored length when non-zero, otherwise

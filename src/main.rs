@@ -1,13 +1,7 @@
 //! bigtool — reader/extractor for EA "EB" `.big` archives, plus PS4 GNF texture conversion.
 
-mod big;
-mod census;
-mod chunkref;
-mod chunkzip;
-mod refpack;
-mod pack;
-mod textures;
 
+use bigtool::{big, census, pack, textures};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 

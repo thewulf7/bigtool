@@ -312,9 +312,13 @@ impl Archive {
             let addr_units = be32(&self.data, off);
             let alt = be32(&self.data, off + 4);
             let size = be32(&self.data, off + 8);
+            // Record is { addr_units, stored_size, other }. Which of the last two carries the
+            // stored length varies: in the 12 top-level archives field 2 is always 0 and field 3
+            // is the length; in ~30 nested archives field 2 holds the length and field 3 is a
+            // constant (0x100100), so trusting field 3 first pushed every entry out of bounds.
             info.push(Some(EntryInfo {
                 address: (addr_units as u64) << self.addr_shift,
-                size: if size != 0 { size as u64 } else { alt as u64 },
+                size: if alt != 0 { alt as u64 } else { size as u64 },
             }));
         }
         self.info = info;

@@ -91,8 +91,18 @@ textures**, **10 437 `.mcd` files are all `RSF\0` model containers**, and 30 `.d
 | `0x1c` | u32 BE | file length (wraps modulo 2^32 above 4 GiB) |
 | `0x30` | — | file-info table (16- or 20-byte stride) |
 
-Each file-info record is `{ addr_units, alt, size }` big-endian; `address = addr_units << shift`
-where `shift = buf[0x0a] & 0x3f`, and `size == 0` falls back to `alt`.
+Each file-info record is `{ addr_units, stored_size, other }` big-endian, with
+`address = addr_units << shift` where `shift = buf[0x0a] & 0x3f`.
+
+Which of the last two fields carries the stored length varies by archive, and getting it wrong is
+silent until ranges overflow:
+
+- the twelve top-level archives keep field 2 at **0** and store the length in field 3;
+- about thirty nested archives do the opposite: field 2 holds the length and field 3 is a constant
+  `0x100100`.
+
+So the rule is "field 2 when non-zero, otherwise field 3". Trusting field 3 first put 220 entries
+across 30 archives out of bounds; with the corrected rule all 1 609 archives pack cleanly.
 
 ### The indexing rule
 
@@ -159,8 +169,7 @@ chunkref         : 621 unwrapped
 nested           : 1241 archives, 28415 files (220 inner entries unreadable)
 ```
 
-Recursion stops at depth 4. The 220 unreadable entries are the same defect already noted for the
-top-level archives: their records point past the end of their own archive.
+Recursion stops at depth 4. All 1 609 archives now extract without unreadable entries.
 
 ## Packing
 
@@ -238,6 +247,12 @@ Outputs were compared byte-for-byte against the original Python implementation:
 - `pack`: build a `.big` from a directory tree, with `--template` for drop-in replacement of a
   shipped archive. Round-trip verified byte-exact (58 and 2 656 file trees).
 - `check` recognises `RSF ` model containers and `chunkref` stubs as known payloads.
+
+**1.3.1**
+- Fixed the file-info record length field: field 2 is the stored length when non-zero, otherwise
+  field 3. Field 3 is a constant `0x100100` in ~30 nested archives, which had pushed 220 entries out
+  of bounds. All 1 609 archives now extract cleanly (`fe_fix_demo`: 28 635 nested files, up 220).
+- Same correction applied to the Python reference implementation.
 
 **1.3.0**
 - `extract --recurse`: unwrap `chunkref` (RefPack) containers and extract archives found inside

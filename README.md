@@ -290,7 +290,7 @@ Outputs were compared byte-for-byte against the original Python implementation:
 **1.2.0**
 - `pack`: build a `.big` from a directory tree, with `--template` for drop-in replacement of a
   shipped archive. Round-trip verified byte-exact (58 and 2 656 file trees).
-- `check` recognises `RSF ` model containers and `chunkref` stubs as known payloads.
+- `check` recognises `RSF`+`0x00` model containers and `chunkref` stubs as known payloads.
 
 **1.5.0**
 - `extract --entry <index|substring>` extracts exactly one entry; an ambiguous selector lists the

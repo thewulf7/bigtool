@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# local test data — never commit game archives or extracted assets
+*.big
+*.gnf
+*.dds
+*.mcd
+*.pkg
+testdata/

@@ -1,7 +1,7 @@
 //! bigtool GUI — browse EA `.big` archives, extract them, convert GNF textures, and pack folders.
 
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 
 use bigtool::big::{Archive, Record};
@@ -49,6 +49,8 @@ pub struct App {
     tex_out: Option<PathBuf>,
     pack_src: Option<PathBuf>,
     pack_out: Option<PathBuf>,
+    pack_template: Option<PathBuf>,
+    pack_compress: packlib::Compress,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -85,6 +87,8 @@ impl App {
             tex_out: None,
             pack_src: None,
             pack_out: None,
+            pack_template: None,
+            pack_compress: packlib::Compress::Auto,
         }
     }
 
@@ -195,35 +199,27 @@ impl App {
             self.log_line("choose an output folder first");
             return;
         };
-        let (path, limit) = if only_selected {
-            match self.selected {
-                Some(i) => (a.path.clone(), Some(i + 1)),
-                None => {
-                    self.log_line("no entry selected");
-                    return;
-                }
-            }
-        } else {
-            (a.path.clone(), None)
-        };
-        // extracting "up to index" would include everything before it; do a single-file pass instead
-        let single = if only_selected { self.selected } else { None };
+        let path = a.path.clone();
+        let selected = self.selected;
+        if only_selected && selected.is_none() {
+            self.log_line("no entry selected");
+            return;
+        }
         let decompress = self.decompress;
         let recurse = self.recurse;
         let skip = self.skip_existing;
 
         let (tx, rx) = channel();
-        let tx2: Sender<Msg> = tx.clone();
         thread::spawn(move || {
             let arc = match Archive::open(&path) {
                 Ok(a) => a,
                 Err(e) => {
-                    let _ = tx2.send(Msg::Done(format!("error: {e}")));
+                    let _ = tx.send(Msg::Done(format!("error: {e}")));
                     return;
                 }
             };
             let mut progress = |done: usize, total: usize, bytes: u64, total_bytes: u64| {
-                let _ = tx2.send(Msg::Progress {
+                let _ = tx.send(Msg::Progress {
                     done,
                     total,
                     bytes,
@@ -231,28 +227,34 @@ impl App {
                     note: String::new(),
                 });
             };
-            if let Some(idx) = single {
-                // extract the archive but stop after the selected entry
-                let rep = arc.extract(
-                    &out, Some(idx + 1), false, decompress, skip, recurse, 0,
+            let rep = match (only_selected, selected) {
+                (true, Some(idx)) => arc.extract_only(
+                    &out,
+                    &[idx],
+                    false,
+                    decompress,
+                    skip,
+                    recurse,
+                    0,
                     Some(&mut progress as &mut dyn FnMut(usize, usize, u64, u64)),
-                );
-                let _ = tx2.send(Msg::Done(format!(
-                    "wrote {} file(s) (prefix up to entry {}), {} failed",
-                    rep.written, idx, rep.failed
-                )));
-            } else {
-                let rep = arc.extract(
-                    &out, limit, false, decompress, skip, recurse, 0,
+                ),
+                _ => arc.extract(
+                    &out,
+                    None,
+                    false,
+                    decompress,
+                    skip,
+                    recurse,
+                    0,
                     Some(&mut progress as &mut dyn FnMut(usize, usize, u64, u64)),
-                );
-                let _ = tx2.send(Msg::Done(format!(
-                    "{} written, {} skipped, {} failed  ·  chunkzip {}  ·  chunkref {}  ·  nested {} archives / {} files",
-                    rep.written, rep.skipped, rep.failed,
-                    rep.decoded_chunkzip, rep.decoded_chunkref,
-                    rep.nested_archives, rep.nested_files
-                )));
-            }
+                ),
+            };
+            let _ = tx.send(Msg::Done(format!(
+                "{} written, {} skipped, {} failed  ·  chunkzip {}  ·  chunkref {}  ·  nested {} archives / {} files",
+                rep.written, rep.skipped, rep.failed,
+                rep.decoded_chunkzip, rep.decoded_chunkref,
+                rep.nested_archives, rep.nested_files
+            )));
         });
 
         self.job = Some(Job {
@@ -300,15 +302,18 @@ impl App {
             self.log_line("choose a source folder and an output .big path");
             return;
         };
+        let template = self.pack_template.clone();
+        let mode = self.pack_compress;
         let (tx, rx) = channel();
         thread::spawn(move || {
-            match packlib::pack(&src, &out, None) {
+            match packlib::pack(&src, &out, template.as_deref(), mode) {
                 Ok(rep) => {
                     let _ = tx.send(Msg::Done(format!(
-                        "packed {} files  ·  {} archive  ·  {} trie nodes",
+                        "packed {} files  ·  {} archive  ·  {} trie nodes  ·  {} compressed",
                         rep.files,
                         human(rep.out_bytes),
-                        rep.trie_nodes
+                        rep.trie_nodes,
+                        rep.compressed
                     )));
                 }
                 Err(e) => {
@@ -402,7 +407,7 @@ impl App {
                 action = Some(false);
             }
             if ui
-                .add_enabled(!busy && self.selected.is_some(), egui::Button::new("Extract up to selection"))
+                .add_enabled(!busy && self.selected.is_some(), egui::Button::new("Extract selected"))
                 .clicked()
             {
                 action = Some(true);
@@ -431,6 +436,9 @@ impl App {
 
         TableBuilder::new(ui)
             .striped(true)
+            // without this the rows only sense hover, so clicking never selects and the
+            // single-entry buttons stay disabled forever
+            .sense(egui::Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::remainder().at_least(280.0))
             .column(Column::exact(60.0))
@@ -498,6 +506,28 @@ impl App {
         ui.label("Writes the header, file-info table, name table, directory trie and 4 KiB-aligned data.");
         ui.add_space(8.0);
         self.path_row(ui, "Source folder", Field::PackSrc);
+        ui.horizontal(|ui| {
+            if ui.button("Template archive…").clicked() {
+                if let Some(p) = rfd::FileDialog::new().add_filter("EA archive", &["big"]).pick_file() {
+                    self.pack_template = Some(p);
+                }
+            }
+            if ui.small_button("clear").clicked() {
+                self.pack_template = None;
+            }
+            let label = self
+                .pack_template
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "none (layout knobs and per-entry tails default to zero)".into());
+            ui.label(egui::RichText::new(label).weak());
+        });
+        ui.horizontal(|ui| {
+            ui.label("Payload:");
+            ui.selectable_value(&mut self.pack_compress, packlib::Compress::None, "store raw");
+            ui.selectable_value(&mut self.pack_compress, packlib::Compress::Auto, "match template");
+            ui.selectable_value(&mut self.pack_compress, packlib::Compress::All, "compress all");
+        });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             if ui.button("Output .big…").clicked() {

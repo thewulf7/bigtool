@@ -74,6 +74,9 @@ enum Cmd {
         /// unwrap chunkref (RefPack) entries and extract archives found inside archives
         #[arg(long)]
         recurse: bool,
+        /// extract one entry: an index from `list`, or a substring of its path
+        #[arg(long)]
+        entry: Option<String>,
         #[arg(long)]
         no_progress: bool,
     },
@@ -98,9 +101,12 @@ enum Cmd {
         source: PathBuf,
         #[arg(short = 'o', long)]
         out: PathBuf,
-        /// copy header fields and per-entry metadata from this archive
+        /// copy header fields, per-entry metadata, and which entries were chunkzip containers
         #[arg(long)]
         template: Option<PathBuf>,
+        /// payload storage: auto (match the template), all, or none
+        #[arg(short = 'c', long, default_value = "auto")]
+        compress: String,
     },
     /// Extract every *.big in a directory
     Batch {
@@ -165,8 +171,19 @@ fn main() {
             decompress,
             skip_existing,
             recurse,
+            entry,
             no_progress,
-        } => cmd_extract(&archive, &out, limit, flat, decompress, skip_existing, recurse, no_progress),
+        } => cmd_extract(
+            &archive,
+            &out,
+            limit,
+            flat,
+            decompress,
+            skip_existing,
+            recurse,
+            entry.as_deref(),
+            no_progress,
+        ),
         Cmd::Textures {
             archive,
             out,
@@ -178,7 +195,16 @@ fn main() {
             source,
             out,
             template,
-        } => cmd_pack(&source, &out, template.as_deref()),
+            compress,
+        } => {
+            match pack::Compress::parse(&compress) {
+                Some(mode) => cmd_pack(&source, &out, template.as_deref(), mode),
+                None => {
+                    eprintln!("unknown --compress value {compress:?} (auto, all, none)");
+                    2
+                }
+            }
+        }
         Cmd::Batch {
             directory,
             out,
@@ -442,13 +468,47 @@ fn cmd_extract(
     decompress: bool,
     skip_existing: bool,
     recurse: bool,
+    entry: Option<&str>,
     no_progress: bool,
 ) -> i32 {
     let Some(arc) = open(path) else { return 2 };
 
+    // resolve --entry to file-info positions
+    let selected: Option<Vec<usize>> = match entry {
+        None => None,
+        Some(spec) => {
+            let all = arc.records();
+            let hits: Vec<usize> = if let Ok(idx) = spec.parse::<usize>() {
+                if idx < all.len() { vec![idx] } else { Vec::new() }
+            } else {
+                let needle = spec.to_lowercase();
+                all.iter()
+                    .filter(|r| r.path.to_lowercase().contains(&needle))
+                    .map(|r| r.position)
+                    .collect()
+            };
+            match hits.len() {
+                0 => {
+                    eprintln!("no entry matches {spec:?}");
+                    return 2;
+                }
+                1 => Some(hits),
+                n => {
+                    eprintln!("{n} entries match {spec:?} -- narrow it down:");
+                    for r in arc.records().iter().filter(|r| hits.contains(&r.position)).take(20) {
+                        eprintln!("  {:>5}  {}", r.position, r.path);
+                    }
+                    return 2;
+                }
+            }
+        }
+    };
+
     let (planned, total_bytes) = {
         let mut r = arc.records();
-        if let Some(l) = limit {
+        if let Some(sel) = &selected {
+            r.retain(|x| sel.contains(&x.position));
+        } else if let Some(l) = limit {
             r.truncate(l);
         }
         let bytes: u64 = r
@@ -480,16 +540,28 @@ fn cmd_extract(
         }
     };
 
-    let rep = arc.extract(
-        out,
-        limit,
-        flat,
-        decompress,
-        skip_existing,
-        recurse,
-        0,
-        Some(&mut tick as &mut dyn FnMut(usize, usize, u64, u64)),
-    );
+    let rep = match &selected {
+        Some(sel) => arc.extract_only(
+            out,
+            sel,
+            flat,
+            decompress,
+            skip_existing,
+            recurse,
+            0,
+            Some(&mut tick as &mut dyn FnMut(usize, usize, u64, u64)),
+        ),
+        None => arc.extract(
+            out,
+            limit,
+            flat,
+            decompress,
+            skip_existing,
+            recurse,
+            0,
+            Some(&mut tick as &mut dyn FnMut(usize, usize, u64, u64)),
+        ),
+    };
 
     if let Some(pb) = pb {
         pb.finish_and_clear();
@@ -651,15 +723,24 @@ fn cmd_textures(
     0
 }
 
-fn cmd_pack(src: &Path, out: &Path, template: Option<&Path>) -> i32 {
+fn cmd_pack(src: &Path, out: &Path, template: Option<&Path>, mode: pack::Compress) -> i32 {
     let start = Instant::now();
-    match pack::pack(src, out, template) {
+    match pack::pack(src, out, template, mode) {
         Ok(rep) => {
             println!("output           : {}", out.display());
             println!("files            : {}", rep.files);
             println!("data bytes       : {}", human(rep.data_bytes));
             println!("archive size     : {}", human(rep.out_bytes));
             println!("trie nodes       : {}", rep.trie_nodes);
+            if rep.compressed > 0 {
+                println!(
+                    "compressed       : {} entries, {} -> {} ({:.1}% of raw)",
+                    rep.compressed,
+                    human(rep.raw_of_compressed),
+                    human(rep.compressed_bytes),
+                    100.0 * rep.compressed_bytes as f64 / rep.raw_of_compressed.max(1) as f64
+                );
+            }
             println!(
                 "template metadata: {}",
                 if rep.used_template { "used" } else { "none" }
@@ -724,6 +805,7 @@ fn cmd_batch(
             decompress,
             skip_existing,
             recurse,
+            None,
             no_progress,
         );
         if code != 0 {

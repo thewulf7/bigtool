@@ -217,7 +217,29 @@ Round-trip is verified byte-exact by the tool's own reader:
 
 ### What packing does not do yet
 
-- **Payloads are written uncompressed.** Shipped archives wrap many entries in `chunkzip`; the
+- **`--compress` controls how payloads are stored:
+
+| value | behaviour |
+|---|---|
+| `auto` (default) | chunkzip where the `--template` archive did — retail stores 2 553 of 2 656 `anim.big` entries that way |
+| `all` | chunkzip every entry above 64 bytes |
+| `none` | raw bytes |
+
+Compression matters: repacking `patch_b.big` uncompressed produced ~600 MB against the 410 MB
+shipped file. With `--compress auto` the result is **409.16 MiB against 429.55 MB — 99.9% of the
+shipped size** — and repacked `anim.big` is 1 021.9 MB against 1 024.9 MB.
+
+### Writing chunkzip containers
+
+The encoder relies on the framing recovered from 848 chunks in 16 retail containers: every chunk's
+raw-DEFLATE stream starts on a 16-byte boundary, immediately preceded by
+`{ u32 compressed_size, u32 1 }`, with zero fill back to the previous stream. Chunks after the first
+are compressed against the previous 32 KiB of *decompressed* output.
+
+Compression is level 9: across 48 retail containers that came to **99.3% of EA's own size**
+(level 6 was 103.6%), with zero round-trip failures.
+
+Payloads are written uncompressed.** Shipped archives wrap many entries in `chunkzip`; the
   loader distinguishes by magic and every archive already contains uncompressed entries, but a
   repacked archive is therefore larger than the original. Re-compression is not implemented.
 - The **8-byte record tail** copied from the template (or zeroed without one) is not understood. If
@@ -269,6 +291,18 @@ Outputs were compared byte-for-byte against the original Python implementation:
 - `pack`: build a `.big` from a directory tree, with `--template` for drop-in replacement of a
   shipped archive. Round-trip verified byte-exact (58 and 2 656 file trees).
 - `check` recognises `RSF ` model containers and `chunkref` stubs as known payloads.
+
+**1.5.0**
+- `extract --entry <index|substring>` extracts exactly one entry; an ambiguous selector lists the
+  candidates instead of guessing.
+- `pack --compress auto|all|none`: payloads are written as chunkzip containers again, matching the
+  template's per-entry choice. Repacked archives land at 99.9% of the shipped size instead of ~150%.
+- `chunkzip::encode`: raw DEFLATE at level 9 with the 32 KiB preset dictionary, in the recovered
+  retail framing (16-byte-aligned streams, `{size, 1}` pair before each, zero fill between).
+- Verified: `patch_b.big` repacked and re-extracted byte-identical (58/58), `anim.big` likewise
+  (2 656/2 656).
+- The GUI gained "Extract selected" (one entry, not a prefix) and pack options for template and
+  payload storage.
 
 **1.4.0**
 - Desktop app (`bigtool-gui`): archive browser, extract with live progress, single-entry export,

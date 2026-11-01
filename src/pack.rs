@@ -52,6 +52,34 @@ pub struct PackReport {
     pub out_bytes: u64,
     pub trie_nodes: usize,
     pub used_template: bool,
+    /// entries written as chunkzip containers
+    pub compressed: usize,
+    /// bytes those entries occupied before compression
+    pub raw_of_compressed: u64,
+    /// bytes they occupy once compressed
+    pub compressed_bytes: u64,
+}
+
+/// How payloads are stored.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Compress {
+    /// always store raw bytes
+    None,
+    /// store chunkzip where the template archive did (default)
+    Auto,
+    /// chunkzip every entry bigger than the container overhead
+    All,
+}
+
+impl Compress {
+    pub fn parse(s: &str) -> Option<Compress> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" | "off" | "raw" => Some(Compress::None),
+            "auto" | "template" => Some(Compress::Auto),
+            "all" | "on" => Some(Compress::All),
+            _ => None,
+        }
+    }
 }
 
 struct Node {
@@ -64,6 +92,7 @@ struct Node {
 #[derive(Clone, Default)]
 struct EntryMeta {
     tail: [u8; 8],
+    compressed: bool,
     third: Option<u32>,
 }
 
@@ -137,10 +166,16 @@ fn template_meta(path: &Path) -> std::io::Result<(HashMap<String, EntryMeta>, Op
             }
             break;
         }
+        let compressed = arc
+            .data
+            .get(addr as usize..(addr as usize).saturating_add(8).min(arc.data.len()))
+            .map(crate::chunkzip::is_chunkzip)
+            .unwrap_or(false);
         map.insert(
             rec.path.clone(),
             EntryMeta {
                 tail,
+                compressed,
                 third: thirds.get(&rec.path).copied(),
             },
         );
@@ -155,7 +190,12 @@ fn template_meta(path: &Path) -> std::io::Result<(HashMap<String, EntryMeta>, Op
     Ok((map, Some(opts)))
 }
 
-pub fn pack(src: &Path, out: &Path, template: Option<&Path>) -> std::io::Result<PackReport> {
+pub fn pack(
+    src: &Path,
+    out: &Path,
+    template: Option<&Path>,
+    mode: Compress,
+) -> std::io::Result<PackReport> {
     let (meta, tpl_opts) = match template {
         Some(t) => template_meta(t)?,
         None => (HashMap::new(), None),
@@ -304,14 +344,8 @@ pub fn pack(src: &Path, out: &Path, template: Option<&Path>) -> std::io::Result<
     let trie_off1 = off1 - trie_off0;
     let data_start = align_up(off1 + trie_size as u64, 4096);
 
-    // ---- data offsets
-    let mut addresses = Vec::with_capacity(n);
-    let mut cursor = data_start;
-    for (_, _, size) in files.iter() {
-        addresses.push(cursor);
-        cursor = align_up(cursor + size, unit);
-    }
-    let _total_len = cursor;
+    // Addresses can only be known after each payload is compressed, so the entry table is
+    // reserved here and rewritten once the data section exists.
 
     // ---- write
     let f = File::create(out)?;
@@ -334,20 +368,8 @@ pub fn pack(src: &Path, out: &Path, template: Option<&Path>) -> std::io::Result<
     // 16 bytes of padding between the header and the file-info table (table starts at 0x30)
     w.write_all(&[0u8; (ENTRY_TABLE_OFFSET as usize) - HEADER_LEN])?;
 
-    // entry table
-    let mut table = vec![0u8; entry_table_bytes];
-    for (i, (name, _, size)) in files.iter().enumerate() {
-        let base = i * stride;
-        let units = (addresses[i] >> shift) as u32;
-        table[base..base + 4].copy_from_slice(&units.to_be_bytes());
-        table[base + 4..base + 8].copy_from_slice(&0u32.to_be_bytes());
-        table[base + 8..base + 12].copy_from_slice(&(*size as u32).to_be_bytes());
-        if stride >= 20 {
-            let tail = meta.get(name).map(|m| m.tail).unwrap_or([0u8; 8]);
-            table[base + 12..base + 20].copy_from_slice(&tail);
-        }
-    }
-    w.write_all(&table)?;
+    // entry table: reserved now, filled in after the payloads are written
+    w.write_all(&vec![0u8; entry_table_bytes])?;
 
     // zero gap up to trie_off0
     let mut pos = ENTRY_TABLE_OFFSET + entry_table_bytes as u64;
@@ -396,18 +418,60 @@ pub fn pack(src: &Path, out: &Path, template: Option<&Path>) -> std::io::Result<
         w.write_all(&vec![0u8; (data_start - after_trie) as usize])?;
     }
 
-    // data, 4 KiB aligned per record
+    // data, aligned per record; payload may be a chunkzip container
+    let mut written: Vec<(u64, u32)> = Vec::with_capacity(n);
     let mut wrote = data_start;
-    for (i, (_, path, size)) in files.iter().enumerate() {
-        if addresses[i] > wrote {
-            w.write_all(&vec![0u8; (addresses[i] - wrote) as usize])?;
-            wrote = addresses[i];
-        }
+    let mut n_compressed = 0usize;
+    let mut raw_of_compressed = 0u64;
+    let mut compressed_bytes = 0u64;
+
+    for (name, path, _) in files.iter() {
         let data = fs::read(path)?;
-        w.write_all(&data)?;
-        wrote += data.len() as u64;
-        let _ = size;
+        let want = match mode {
+            Compress::None => false,
+            Compress::All => data.len() > 64,
+            // mirror the template: those entries were containers in the shipped archive
+            Compress::Auto => meta.get(name).map(|m| m.compressed).unwrap_or(false) && data.len() > 64,
+        };
+        let payload: std::borrow::Cow<[u8]> = if want {
+            match crate::chunkzip::encode(&data) {
+                Ok(c) if c.len() < data.len() => {
+                    n_compressed += 1;
+                    raw_of_compressed += data.len() as u64;
+                    compressed_bytes += c.len() as u64;
+                    std::borrow::Cow::Owned(c)
+                }
+                _ => std::borrow::Cow::Borrowed(&data),
+            }
+        } else {
+            std::borrow::Cow::Borrowed(&data)
+        };
+
+        let addr = align_up(wrote, unit);
+        if addr > wrote {
+            w.write_all(&vec![0u8; (addr - wrote) as usize])?;
+        }
+        w.write_all(&payload)?;
+        written.push((addr, payload.len() as u32));
+        wrote = addr + payload.len() as u64;
     }
+
+    // now that the sizes are known, go back and fill the entry table
+    w.flush()?;
+    let mut table = vec![0u8; entry_table_bytes];
+    for (i, (name, _, _)) in files.iter().enumerate() {
+        let base = i * stride;
+        let (addr, stored) = written[i];
+        table[base..base + 4].copy_from_slice(&((addr >> shift) as u32).to_be_bytes());
+        table[base + 4..base + 8].copy_from_slice(&0u32.to_be_bytes());
+        table[base + 8..base + 12].copy_from_slice(&stored.to_be_bytes());
+        if stride >= 20 {
+            let tail = meta.get(name).map(|m| m.tail).unwrap_or([0u8; 8]);
+            table[base + 12..base + 20].copy_from_slice(&tail);
+        }
+    }
+    w.seek(SeekFrom::Start(ENTRY_TABLE_OFFSET))?;
+    w.write_all(&table)?;
     w.flush()?;
 
     // patch the true length (the field is 32-bit and wraps on huge archives)
@@ -418,6 +482,9 @@ pub fn pack(src: &Path, out: &Path, template: Option<&Path>) -> std::io::Result<
 
     Ok(PackReport {
         files: n,
+        compressed: n_compressed,
+        raw_of_compressed,
+        compressed_bytes,
         data_bytes: wrote - data_start,
         out_bytes: wrote,
         trie_nodes: out_nodes.len(),

@@ -644,13 +644,44 @@ impl Archive {
         skip_existing: bool,
         recurse: bool,
         depth: usize,
-        mut progress: Option<&mut dyn FnMut(usize, usize, u64, u64)>,
+        progress: Option<&mut dyn FnMut(usize, usize, u64, u64)>,
     ) -> ExtractReport {
-        let mut rep = ExtractReport::default();
         let mut planned = self.records();
         if let Some(limit) = limit {
             planned.truncate(limit);
         }
+        self.extract_plan(out_dir, planned, flat, decompress, skip_existing, recurse, depth, progress)
+    }
+
+    /// Extract only the entries at the given file-info positions.
+    pub fn extract_only(
+        &self,
+        out_dir: &Path,
+        indices: &[usize],
+        flat: bool,
+        decompress: bool,
+        skip_existing: bool,
+        recurse: bool,
+        depth: usize,
+        progress: Option<&mut dyn FnMut(usize, usize, u64, u64)>,
+    ) -> ExtractReport {
+        let all = self.records();
+        let planned: Vec<Record> = indices.iter().filter_map(|i| all.get(*i).cloned()).collect();
+        self.extract_plan(out_dir, planned, flat, decompress, skip_existing, recurse, depth, progress)
+    }
+
+    fn extract_plan(
+        &self,
+        out_dir: &Path,
+        planned: Vec<Record>,
+        flat: bool,
+        decompress: bool,
+        skip_existing: bool,
+        recurse: bool,
+        depth: usize,
+        mut progress: Option<&mut dyn FnMut(usize, usize, u64, u64)>,
+    ) -> ExtractReport {
+        let mut rep = ExtractReport::default();
         let total_files = planned.len();
         let total_bytes: u64 = planned
             .iter()

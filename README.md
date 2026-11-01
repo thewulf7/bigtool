@@ -23,6 +23,7 @@ bigtool list     ARCHIVE            file index with positions, addresses, sizes
 bigtool check    ARCHIVE            validate pointers, payloads, and type-vs-extension
 bigtool census   ARCHIVE            classify payload types (chunkzip/RSF/GNF/media/...)
 bigtool extract  ARCHIVE -o DIR     write files to disk
+bigtool pack     DIR -o ARCHIVE     build a .big from a directory tree
 bigtool textures FILE.gnf           convert one GNF texture to DDS
 bigtool textures --batch SRC OUT    convert every GNF under a directory
 bigtool batch    DIR -o OUT         extract every *.big in a directory
@@ -130,6 +131,39 @@ swizzled** in 8×8 block tiles, which this tool undoes per mip level.
 Formats handled: BC1 (0x23), BC2, BC3, BC4, BC5, BC6, BC7 and RGBA8 (0x0a). Unsupported formats
 are skipped and reported by name rather than written corrupt.
 
+## Packing
+
+`pack` rebuilds an archive from a directory tree — the reverse of `extract`:
+
+```bash
+bigtool pack extracted/patch_b -o patch_b_new.big --template patch_b.big
+```
+
+It writes the header, file-info table, flat name table, directory trie and a 4 KiB-aligned data
+section. `--template` copies the header parameters (entry stride, name length, flags, address
+shift) and the per-entry metadata in the record tail from an existing archive, so a modified tree
+repacks into a drop-in replacement; without it the defaults are stride 20, name length sized to the
+longest basename, and shift 12.
+
+Round-trip is verified byte-exact by the tool's own reader:
+
+| Tree | Files | pack + extract |
+|---|---|---|
+| `patch_b` | 58 | identical |
+| `anim` (91 directories) | 2 656 | identical |
+| fresh tree, no template | 5 (incl. duplicate basenames) | identical |
+
+### What packing does not do yet
+
+- **Payloads are written uncompressed.** Shipped archives wrap many entries in `chunkzip`; the
+  loader distinguishes by magic and every archive already contains uncompressed entries, but a
+  repacked archive is therefore larger than the original. Re-compression is not implemented.
+- The **8-byte record tail** copied from the template (or zeroed without one) is not understood. If
+  it encodes a compression flag rather than build metadata, a repacked archive would need
+  `chunkzip` payloads to satisfy it — that is the first thing to check if the game rejects one.
+- The directory trie is rebuilt from scratch, so node order may differ from the shipped archive
+  (for `anim`: 2 747 nodes versus 2 746). Paths, names and data all round-trip.
+
 ## Performance
 
 Extracting `anim.big` (2 656 files, 1.5 GB, chunkzip decoded) on a Windows host:
@@ -168,6 +202,11 @@ Outputs were compared byte-for-byte against the original Python implementation:
   separate container formats, not `.big` concerns.
 
 ## Changelog
+
+**1.2.0**
+- `pack`: build a `.big` from a directory tree, with `--template` for drop-in replacement of a
+  shipped archive. Round-trip verified byte-exact (58 and 2 656 file trees).
+- `check` recognises `RSF ` model containers and `chunkref` stubs as known payloads.
 
 **1.1.1**
 - chunkzip: the frame gap is detected per container and tried first, and the final chunk's gap is

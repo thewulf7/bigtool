@@ -3,6 +3,7 @@
 mod big;
 mod census;
 mod chunkzip;
+mod pack;
 mod textures;
 
 use std::path::{Path, PathBuf};
@@ -92,6 +93,16 @@ enum Cmd {
         #[arg(long)]
         no_progress: bool,
     },
+    /// Pack a directory tree into a new .big archive
+    Pack {
+        /// directory containing the files to pack
+        source: PathBuf,
+        #[arg(short = 'o', long)]
+        out: PathBuf,
+        /// copy header fields and per-entry metadata from this archive
+        #[arg(long)]
+        template: Option<PathBuf>,
+    },
     /// Extract every *.big in a directory
     Batch {
         directory: PathBuf,
@@ -160,6 +171,11 @@ fn main() {
             force,
             no_progress,
         } => cmd_textures(archive.as_deref(), out.as_deref(), batch, force, no_progress),
+        Cmd::Pack {
+            source,
+            out,
+            template,
+        } => cmd_pack(&source, &out, template.as_deref()),
         Cmd::Batch {
             directory,
             out,
@@ -608,6 +624,29 @@ fn cmd_textures(
         meta.expected
     );
     0
+}
+
+fn cmd_pack(src: &Path, out: &Path, template: Option<&Path>) -> i32 {
+    let start = Instant::now();
+    match pack::pack(src, out, template) {
+        Ok(rep) => {
+            println!("output           : {}", out.display());
+            println!("files            : {}", rep.files);
+            println!("data bytes       : {}", human(rep.data_bytes));
+            println!("archive size     : {}", human(rep.out_bytes));
+            println!("trie nodes       : {}", rep.trie_nodes);
+            println!(
+                "template metadata: {}",
+                if rep.used_template { "used" } else { "none" }
+            );
+            println!("elapsed          : {:.1}s", start.elapsed().as_secs_f64());
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    }
 }
 
 fn cmd_batch(

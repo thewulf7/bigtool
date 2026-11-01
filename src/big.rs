@@ -611,6 +611,8 @@ impl Archive {
         flat: bool,
         decompress: bool,
         skip_existing: bool,
+        recurse: bool,
+        depth: usize,
         mut progress: Option<&mut dyn FnMut(usize, usize, u64, u64)>,
     ) -> ExtractReport {
         let mut rep = ExtractReport::default();
@@ -706,6 +708,25 @@ impl Archive {
                 std::borrow::Cow::Borrowed(payload)
             };
 
+            // chunkref holds RefPack streams that decompress to a nested .big archive
+            let written_bytes: std::borrow::Cow<[u8]> =
+                if decompress && crate::chunkref::is_chunkref(&written_bytes) {
+                    match crate::chunkref::decode(&written_bytes) {
+                        Ok((inner, _info)) => {
+                            rep.decoded_chunkref += 1;
+                            std::borrow::Cow::Owned(inner)
+                        }
+                        Err(why) => {
+                            if rep.chunkref_errors.len() < 10 {
+                                rep.chunkref_errors.push((r.path.clone(), why));
+                            }
+                            written_bytes
+                        }
+                    }
+                } else {
+                    written_bytes
+                };
+
             match File::create(&out_path).and_then(|mut f| f.write_all(&written_bytes)) {
                 Ok(()) => rep.written += 1,
                 Err(e) => {
@@ -713,6 +734,20 @@ impl Archive {
                     if rep.errors.len() < 20 {
                         rep.errors.push((r.path.clone(), e.to_string()));
                     }
+                }
+            }
+
+            // recurse into an archive payload, writing its contents beside it
+            if recurse && depth < MAX_RECURSE_DEPTH && written_bytes.len() > 4
+                && &written_bytes[0..2] == b"EB"
+            {
+                rep.nested_archives += 1;
+                let sub_dir = out_dir.join(rel_for_nested(&out_path, out_dir));
+                if let Some(sub) = extract_bytes(&written_bytes, &sub_dir, decompress, recurse, depth + 1)
+                {
+                    rep.nested_files += sub.written;
+                    rep.decoded_chunkzip += sub.decoded_chunkzip;
+                    rep.nested_failed += sub.failed + sub.nested_failed;
                 }
             }
 
@@ -726,6 +761,41 @@ impl Archive {
     }
 }
 
+
+pub const MAX_RECURSE_DEPTH: usize = 4;
+
+/// Directory name for a nested archive's contents: the archive path relative to `out_dir`, without
+/// its extension.
+fn rel_for_nested(path: &Path, out_dir: &Path) -> PathBuf {
+    let rel = path.strip_prefix(out_dir).unwrap_or(path);
+    let mut p = PathBuf::new();
+    p.push(rel);
+    p.set_extension("");
+    p
+}
+
+/// Extract an archive held in memory by spilling it to a temporary file.
+fn extract_bytes(
+    payload: &[u8],
+    out_dir: &Path,
+    decompress: bool,
+    recurse: bool,
+    depth: usize,
+) -> Option<ExtractReport> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("bigtool_nested_{}_{}.big", std::process::id(), n));
+    std::fs::write(&tmp, payload).ok()?;
+    let result = match Archive::open(&tmp) {
+        Ok(arc) => Some(arc.extract(out_dir, None, false, decompress, false, recurse, depth, None)),
+        Err(_) => None,
+    };
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
 #[derive(Default, Debug)]
 pub struct ExtractReport {
     pub written: usize,
@@ -735,6 +805,11 @@ pub struct ExtractReport {
     pub decoded_chunkzip: usize,
     pub chunkzip_left_wrapped: usize,
     pub decode_errors: Vec<(String, String)>,
+    pub decoded_chunkref: usize,
+    pub chunkref_errors: Vec<(String, String)>,
+    pub nested_archives: usize,
+    pub nested_files: usize,
+    pub nested_failed: usize,
 }
 
 #[derive(Debug)]

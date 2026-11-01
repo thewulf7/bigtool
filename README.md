@@ -22,14 +22,15 @@ bigtool info     ARCHIVE            header + structural diagnostics
 bigtool list     ARCHIVE            file index with positions, addresses, sizes
 bigtool check    ARCHIVE            validate pointers, payloads, and type-vs-extension
 bigtool census   ARCHIVE            classify payload types (chunkzip/RSF/GNF/media/...)
-bigtool extract  ARCHIVE -o DIR     write files to disk
+bigtool extract  ARCHIVE -o DIR     write files to disk (--recurse for nested archives)
 bigtool pack     DIR -o ARCHIVE     build a .big from a directory tree
 bigtool textures FILE.gnf           convert one GNF texture to DDS
 bigtool textures --batch SRC OUT    convert every GNF under a directory
 bigtool batch    DIR -o OUT         extract every *.big in a directory
 ```
 
-Useful flags: `--decompress` (unwrap `chunkzip` payloads), `--flat` (no directory tree),
+Useful flags: `--decompress` (unwrap `chunkzip` / `chunkref` payloads), `--recurse` (extract
+archives found inside archives), `--flat` (no directory tree),
 `-n N` (cap entries), `--skip-existing`, `--no-progress`, `--json` (`info` / `list`),
 `-f SUBSTR` (`list`), `--force` (`textures`).
 
@@ -131,6 +132,36 @@ swizzled** in 8×8 block tiles, which this tool undoes per mip level.
 Formats handled: BC1 (0x23), BC2, BC3, BC4, BC5, BC6, BC7 and RGBA8 (0x0a). Unsupported formats
 are skipped and reported by name rather than written corrupt.
 
+## Nested archives and `chunkref`
+
+Entries inside a `.big` often hold another archive. Two container types appear:
+
+| Container | Magic | Contents |
+|---|---|---|
+| `chunkzip` | `chunkzip` | chunked raw DEFLATE, string data and most assets |
+| `chunkref` | `chunkref` | N × RefPack streams that decompress to a nested `.big` |
+
+`--recurse` unwraps both and extracts what it finds, writing an archive's contents into a sibling
+directory named after it (`fe/online/core/scriptpod.big` → `fe/online/core/scriptpod/`).
+`chunkref` entries are replaced on disk by the real archive they referenced, so the output tree
+contains no stubs.
+
+RefPack is EA's LZ77 variant: `0x10FB` header, flag-driven size field, four control forms. Chunkref
+chunks are padded apart, and the magic also occurs inside compressed data, so streams are walked
+sequentially using exact consumed-byte counts rather than by scanning for magic.
+
+Measured on `fe_fix_demo.big` (4.5 GiB, one command, 46 s):
+
+```
+extracted        : 2430 written, 0 skipped, 0 failed
+chunkzip         : 16498 decoded, 0 left as container
+chunkref         : 621 unwrapped
+nested           : 1241 archives, 28415 files (220 inner entries unreadable)
+```
+
+Recursion stops at depth 4. The 220 unreadable entries are the same defect already noted for the
+top-level archives: their records point past the end of their own archive.
+
 ## Packing
 
 `pack` rebuilds an archive from a directory tree — the reverse of `extract`:
@@ -207,6 +238,14 @@ Outputs were compared byte-for-byte against the original Python implementation:
 - `pack`: build a `.big` from a directory tree, with `--template` for drop-in replacement of a
   shipped archive. Round-trip verified byte-exact (58 and 2 656 file trees).
 - `check` recognises `RSF ` model containers and `chunkref` stubs as known payloads.
+
+**1.3.0**
+- `extract --recurse`: unwrap `chunkref` (RefPack) containers and extract archives found inside
+  archives, to depth 4. On `fe_fix_demo.big` that is 1 241 nested archives and 28 415 files in one
+  46 s pass.
+- RefPack decoder with consumed-byte tracking (`refpack.rs`), chunkref container reader
+  (`chunkref.rs`), and unit tests for both.
+- Nested failures are reported separately from top-level ones instead of being merged.
 
 **1.1.1**
 - chunkzip: the frame gap is detected per container and tried first, and the final chunk's gap is

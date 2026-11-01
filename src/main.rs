@@ -2,7 +2,9 @@
 
 mod big;
 mod census;
+mod chunkref;
 mod chunkzip;
+mod refpack;
 mod pack;
 mod textures;
 
@@ -75,6 +77,9 @@ enum Cmd {
         decompress: bool,
         #[arg(long)]
         skip_existing: bool,
+        /// unwrap chunkref (RefPack) entries and extract archives found inside archives
+        #[arg(long)]
+        recurse: bool,
         #[arg(long)]
         no_progress: bool,
     },
@@ -112,6 +117,9 @@ enum Cmd {
         decompress: bool,
         #[arg(long)]
         skip_existing: bool,
+        /// unwrap chunkref (RefPack) entries and extract archives found inside archives
+        #[arg(long)]
+        recurse: bool,
         #[arg(long)]
         no_progress: bool,
     },
@@ -162,8 +170,9 @@ fn main() {
             flat,
             decompress,
             skip_existing,
+            recurse,
             no_progress,
-        } => cmd_extract(&archive, &out, limit, flat, decompress, skip_existing, no_progress),
+        } => cmd_extract(&archive, &out, limit, flat, decompress, skip_existing, recurse, no_progress),
         Cmd::Textures {
             archive,
             out,
@@ -181,8 +190,9 @@ fn main() {
             out,
             decompress,
             skip_existing,
+            recurse,
             no_progress,
-        } => cmd_batch(&directory, out.as_deref(), decompress, skip_existing, no_progress),
+        } => cmd_batch(&directory, out.as_deref(), decompress, skip_existing, recurse, no_progress),
     };
     std::process::exit(code);
 }
@@ -437,6 +447,7 @@ fn cmd_extract(
     flat: bool,
     decompress: bool,
     skip_existing: bool,
+    recurse: bool,
     no_progress: bool,
 ) -> i32 {
     let Some(arc) = open(path) else { return 2 };
@@ -481,6 +492,8 @@ fn cmd_extract(
         flat,
         decompress,
         skip_existing,
+        recurse,
+        0,
         Some(&mut tick as &mut dyn FnMut(usize, usize, u64, u64)),
     );
 
@@ -502,6 +515,24 @@ fn cmd_extract(
             println!("   not decoded: {} ({})", name, why);
         }
     }
+    if rep.decoded_chunkref > 0 || !rep.chunkref_errors.is_empty() {
+        println!("chunkref         : {} unwrapped", rep.decoded_chunkref);
+        for (name, why) in &rep.chunkref_errors {
+            println!("   not unwrapped: {} ({})", name, why);
+        }
+    }
+    if recurse {
+        println!(
+            "nested           : {} archives, {} files{}",
+            rep.nested_archives,
+            rep.nested_files,
+            if rep.nested_failed > 0 {
+                format!("  ({} inner entries unreadable)", rep.nested_failed)
+            } else {
+                String::new()
+            }
+        );
+    }
     for (name, why) in &rep.errors {
         println!("   error: {} ({})", name, why);
     }
@@ -511,7 +542,7 @@ fn cmd_extract(
         planned
     );
 
-    if rep.failed == 0 {
+    if rep.failed == 0 && rep.nested_failed == 0 {
         0
     } else {
         1
@@ -654,6 +685,7 @@ fn cmd_batch(
     out: Option<&Path>,
     decompress: bool,
     skip_existing: bool,
+    recurse: bool,
     no_progress: bool,
 ) -> i32 {
     let entries = match std::fs::read_dir(dir) {
@@ -697,6 +729,7 @@ fn cmd_batch(
             false,
             decompress,
             skip_existing,
+            recurse,
             no_progress,
         );
         if code != 0 {

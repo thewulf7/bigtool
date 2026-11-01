@@ -114,10 +114,12 @@ and JSON files containing EA Reflection geometry instead of markup.
 
 Chunks are **raw DEFLATE** (`window bits -15`, no zlib header), and chunk *i>0* was compressed
 with the previous 32 KiB of decompressed output as a preset dictionary — inflating without it
-fails with "invalid distance too far back". Frame markers between chunks are 10/11/17 bytes wide,
-so the decoder scans a small window and accepts a candidate only when it inflates to exactly the
-expected size. Some archives mix in stored chunks; a backtracking pass handles those. Every decode
-is checked against the declared total, so a wrong framing can never be accepted silently.
+fails with "invalid distance too far back". Each chunk is preceded by a frame marker whose width
+varies per container (10, 11, 12, 17 and 23 bytes observed), so the decoder scans a small window
+and accepts a candidate only when it inflates to exactly the expected size. The final chunk is
+handled exactly: whatever remains after its payload is the frame gap, which resolves containers
+whose last chunk is stored rather than deflated. Every decode is checked against the declared
+total, so a wrong framing can never be accepted silently.
 
 ### GNF textures
 
@@ -155,13 +157,25 @@ Outputs were compared byte-for-byte against the original Python implementation:
 ## Known limits
 
 - Archives ≥ 4 GiB store a wrapped 32-bit length; the real file size from the OS is used instead.
-- Two payloads out of ~32 000 stay wrapped (`tl_half_playoffstandings_east_s.xml` in `anim.big`,
-  `johnsonamir_head_lod2_model.mcd` in `graphics_full.big`). They are extracted losslessly and
-  reported.
+- A nested `.big` archive without a directory trie (they store flat basenames) is extracted with
+  basenames only; this build falls back instead of failing.
+- One payload out of ~150 000 is truncated inside the retail archive itself
+  (`dyckman_floorgarden_norm.gnf` declares 11 chunks / 1 403 136 bytes but is 5 301 bytes short),
+  so it is extracted as the raw container.
 - `Format8` (single-channel) and `Format32_32_32_32` textures are detected and skipped.
 - Cube and array textures are emitted as a single 2D surface.
 - `SBle`, `data`, `GD.STRM`, `RSF\0` and `DB\0` payloads are returned as stored — those are
   separate container formats, not `.big` concerns.
+
+## Changelog
+
+**1.1.1**
+- chunkzip: the frame gap is detected per container and tried first, and the final chunk's gap is
+  derived exactly from the bytes remaining — which decodes containers whose last chunk is stored
+  rather than deflated. Recovers ~460 FE textures that previously stayed wrapped.
+- Nested `.big` archives that carry no directory trie now extract with flat basenames.
+
+**1.1.0** — first Rust release: `info`, `list`, `check`, `census`, `extract`, `textures`, `batch`.
 
 ## License
 
